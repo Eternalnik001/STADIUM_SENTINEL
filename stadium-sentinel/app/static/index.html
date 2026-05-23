@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Stadium Sentinel | Command Console</title>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+<style>
+  :root { --crit:#F44336; --warn:#FFA726; --ok:#4CAF50; --info:#42A5F5; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;
+         display:flex; flex-direction:column; height:100vh; background:#121212; color:#fff; }
+
+  /* Critical alert banner */
+  #alert-banner {
+    display:none; position:fixed; top:0; left:0; right:0; z-index:9999;
+    background:var(--crit); color:#fff; padding:14px 20px;
+    font-weight:700; font-size:1rem; text-align:center;
+    box-shadow:0 4px 24px rgba(244,67,54,0.7);
+    animation: pulse-banner 1s ease-in-out infinite alternate;
+  }
+  @keyframes pulse-banner {
+    from { background: #F44336; box-shadow: 0 4px 24px rgba(244,67,54,0.7); }
+    to   { background: #B71C1C; box-shadow: 0 4px 40px rgba(244,67,54,1); }
+  }
+
+  .main-row { display:flex; flex:1; overflow:hidden; }
+  #map { flex:2; height:100%; }
+  #sidebar { flex:1; min-width:380px; display:flex; flex-direction:column;
+             background:#1e1e1e; border-left:1px solid #333; overflow:hidden; }
+  .header { padding:16px 20px; border-bottom:1px solid #333; flex-shrink:0; }
+  .header h1 { margin:0; font-size:1.3rem; color:var(--ok); letter-spacing:.5px;
+               display:flex; align-items:center; gap:10px; }
+  .header .sub { color:#aaa; margin-top:4px; font-size:.85rem; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%;
+         background:var(--crit); margin-right:6px; vertical-align:middle; }
+  .dot.live { background:var(--ok); box-shadow:0 0 8px var(--ok); }
+
+  /* Threat counter badge */
+  #threat-badge {
+    display:none; background:var(--crit); color:#fff;
+    font-size:.65rem; font-weight:700; padding:2px 7px;
+    border-radius:12px; letter-spacing:.5px; text-transform:uppercase;
+    animation: badge-pulse 2s ease-in-out infinite;
+  }
+  @keyframes badge-pulse {
+    0%,100% { opacity:1; } 50% { opacity:.6; }
+  }
+
+  .section { padding:12px 20px; border-bottom:1px solid #333; flex-shrink:0; }
+  .section h2 { font-size:.7rem; text-transform:uppercase; letter-spacing:1px;
+                color:#888; margin:0 0 8px; }
+  .zone-row { display:flex; justify-content:space-between; padding:5px 0;
+              border-bottom:1px dashed #2a2a2a; font-size:.9rem; }
+  .zone-row:last-child { border-bottom:0; }
+  .util { font-variant-numeric:tabular-nums; font-weight:600; }
+  .util.ok{color:var(--ok)} .util.warn{color:var(--warn)} .util.crit{color:var(--crit)}
+
+  .feed { flex:1; overflow-y:auto; padding:16px 20px; display:flex;
+          flex-direction:column; gap:10px; }
+  .directive-card { background:#2d2d2d; border-radius:8px; padding:12px 14px;
+                    border-left:4px solid var(--warn); }
+  .directive-card.crit { border-left-color:var(--crit); }
+  .directive-card.alert-warn { border-left-color:var(--crit); background:#3a2020; }
+  .directive-card.alert-info { border-left-color:var(--info); }
+  .directive-card .meta { font-size:.75rem; color:#aaa; margin-bottom:6px; }
+  .directive-card .reason { font-size:.9rem; line-height:1.4; }
+  .directive-card .agent { color:var(--info); font-weight:600; font-size:.7rem;
+                           text-transform:uppercase; letter-spacing:.5px; }
+  .directive-card .agent.threat { color:var(--crit); }
+  .zone-popup { color:#000; }
+  .zone-label { background:#000c; color:#fff; padding:2px 6px; border-radius:4px;
+                font-size:11px; border:1px solid var(--ok); white-space:nowrap; }
+</style>
+</head>
+<body>
+
+<!-- Critical alert banner -->
+<div id="alert-banner"></div>
+
+<div class="main-row">
+  <div id="map"></div>
+  <div id="sidebar">
+    <div class="header">
+      <h1>
+        STADIUM SENTINEL
+        <span id="threat-badge">⚠ THREATS</span>
+      </h1>
+      <div class="sub"><span id="dot" class="dot"></span><span id="dot-text">connecting…</span></div>
+    </div>
+    <div class="section">
+      <h2>Top Zones by Utilization</h2>
+      <div id="zones-list"><div style="color:#666">loading…</div></div>
+    </div>
+    <div class="section" style="flex:1; display:flex; flex-direction:column; padding-bottom:0; overflow:hidden;">
+      <h2>Agent Activity Feed</h2>
+      <div class="feed" id="feed">
+        <div style="color:#666; font-style:italic; text-align:center; margin-top:20px;">
+          Waiting for agent activity...
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script>
+const map = L.map('map', { zoomControl:true, attributionControl:false })
+  .setView([12.9788, 77.5996], 18);
+L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
+  maxZoom: 20
+}).addTo(map);
+
+const arrowLayer = L.layerGroup().addTo(map);
+const zoneLayers  = {};
+const zoneNames   = {};
+const zoneCenters = {};
+
+let activeThreats = 0;
+
+function utilColor(p){ if(p>=90)return '#F44336'; if(p>=70)return '#FFA726';
+  if(p>=40)return '#42A5F5'; return '#4CAF50'; }
+function utilClass(p){ if(p>=90)return 'crit'; if(p>=70)return 'warn'; return 'ok'; }
+
+function polyCentroid(geo){
+  const coords = geo.coordinates[0];
+  let x=0, y=0;
+  coords.forEach(([lng,lat])=>{ x+=lng; y+=lat; });
+  return [y/coords.length, x/coords.length];
+}
+
+async function loadZones(){
+  const res = await fetch('/v1/zones');
+  const data = await res.json();
+  data.zones.forEach(z=>{
+    const geo = JSON.parse(z.geojson);
+    const layer = L.geoJSON(geo, {
+      style: { color:'#4CAF50', weight:2, fillOpacity:0.2, fillColor:'#4CAF50' }
+    }).addTo(map);
+    layer.bindPopup(`<div class="zone-popup"><strong>${z.name}</strong><br>Capacity: ${z.capacity}</div>`);
+    zoneLayers[z.id] = layer;
+    zoneNames[z.id]  = z.name;
+    const c = polyCentroid(geo);
+    zoneCenters[z.id] = c;
+    L.marker(c, {
+      icon: L.divIcon({ className:'', html:`<div class="zone-label">${z.name}</div>`, iconSize:[0,0] })
+    }).addTo(map);
+  });
+}
+
+async function refreshHeatmap(){
+  try{
+    const res = await fetch('/v1/zones/all-snapshots');
+    const snaps = await res.json();
+    const rows = [];
+    Object.entries(snaps).forEach(([id, s])=>{
+      const layer = zoneLayers[id];
+      if(layer){
+        const color = utilColor(s.utilization_pct);
+        layer.setStyle({
+          color, fillColor: color,
+          fillOpacity: 0.45 + Math.min(s.utilization_pct/200, 0.35),
+          weight: s.utilization_pct >= 90 ? 4 : 2,
+        });
+      }
+      rows.push({ id, ...s });
+    });
+    rows.sort((a,b)=>b.utilization_pct - a.utilization_pct);
+    document.getElementById('zones-list').innerHTML = rows.slice(0,6).map(z=>`
+      <div class="zone-row">
+        <span>${z.name}</span>
+        <span class="util ${utilClass(z.utilization_pct)}">${z.utilization_pct.toFixed(0)}%</span>
+      </div>`).join('');
+  } catch(e){ console.warn('heatmap refresh failed', e); }
+}
+
+function flashRoute(fromId, toId, severity){
+  const from = zoneCenters[fromId], to = zoneCenters[toId];
+  if(!from || !to) return;
+  const color = severity === 'critical' ? '#F44336' : '#FFA726';
+  const line = L.polyline([from, to], {
+    color, weight:4, opacity:0.9, dashArray:'10,8'
+  }).addTo(arrowLayer);
+  setTimeout(()=>arrowLayer.removeLayer(line), 12000);
+}
+
+function showAlertBanner(title, detail){
+  const banner = document.getElementById('alert-banner');
+  banner.textContent = `⚠ CRITICAL: ${title} — ${detail}`;
+  banner.style.display = 'block';
+  setTimeout(()=>{ banner.style.display = 'none'; }, 8000);
+}
+
+function updateThreatBadge(delta){
+  activeThreats = Math.max(0, activeThreats + delta);
+  const badge = document.getElementById('threat-badge');
+  if(activeThreats > 0){
+    badge.style.display = 'inline-block';
+    badge.textContent = `⚠ ${activeThreats} THREAT${activeThreats > 1 ? 'S' : ''}`;
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+function addFeedItem(d, isHistory, isAlert){
+  const feed = document.getElementById('feed');
+  const waiting = feed.querySelector('div[style*="Waiting"]');
+  if(waiting) waiting.remove();
+
+  const sev = d.severity || 'warn';
+  const card = document.createElement('div');
+
+  if(isAlert){
+    const cls = sev === 'critical' ? 'alert-warn' : 'alert-info';
+    card.className = `directive-card ${cls}`;
+    card.innerHTML = `
+      <div class="meta">
+        <span class="agent threat">${d.issued_by_agent || 'ThreatAgent'}</span>
+        · alert · ${new Date(d.ts || Date.now()).toLocaleTimeString()}
+        · ${(d.confidence*100).toFixed(0)}% conf
+      </div>
+      <div class="reason"><strong>${d.title || 'Anomaly Detected'}</strong></div>
+      <div class="reason" style="margin-top:4px; color:#ffb3b3;">${d.detail || ''}</div>
+    `;
+  } else {
+    const fromName = zoneNames[d.from_zone_id] || d.from_zone_name || d.from_zone || '—';
+    const toName   = zoneNames[d.to_zone_id]   || d.to_zone_name   || d.to_zone   || '—';
+    card.className = 'directive-card' + (sev === 'critical' ? ' crit' : '');
+    card.innerHTML = `
+      <div class="meta">
+        <span class="agent">${d.issued_by_agent || 'agent'}</span>
+        · ${isHistory ? 'history' : 'live'}
+        · ${new Date(d.ts || d.created_at || Date.now()).toLocaleTimeString()}
+        · ${(d.confidence*100).toFixed(0)}% conf
+      </div>
+      <div class="reason"><strong>${fromName}</strong> &rarr; <strong>${toName}</strong></div>
+      <div class="reason" style="margin-top:4px; color:#bbb;">${d.reason}</div>
+    `;
+  }
+
+  feed.prepend(card);
+  while(feed.children.length > 40) feed.removeChild(feed.lastChild);
+}
+
+async function backfillFeed(){
+  try{
+    const res = await fetch('/v1/zones/recent-directives?limit=10');
+    const items = await res.json();
+    items.reverse().forEach(d=>addFeedItem(d, true, false));
+  } catch(e){ console.warn('backfill failed', e); }
+}
+
+function connectWS(){
+  const base = (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+  const dot = document.getElementById('dot');
+  const dotText = document.getElementById('dot-text');
+
+  // --- Directives WebSocket ---
+  const wsDir = new WebSocket(base + '/v1/ws/directives');
+  wsDir.onopen = () => { dot.classList.add('live'); dotText.textContent = 'live'; };
+  wsDir.onmessage = (e) => {
+    try{
+      const d = JSON.parse(e.data);
+      addFeedItem(d, false, false);
+      flashRoute(d.from_zone_id, d.to_zone_id, d.severity);
+    } catch(err){ console.error('bad directive msg', err); }
+  };
+  wsDir.onclose = () => {
+    dot.classList.remove('live'); dotText.textContent = 'reconnecting…';
+    setTimeout(connectWS, 2000);
+  };
+  wsDir.onerror = () => wsDir.close();
+
+  // --- Alerts WebSocket ---
+  const wsAlerts = new WebSocket(base + '/v1/ws/alerts');
+  wsAlerts.onmessage = (e) => {
+    try{
+      const a = JSON.parse(e.data);
+      addFeedItem(a, false, true);
+      if(a.severity === 'critical'){
+        showAlertBanner(a.title, a.detail);
+        updateThreatBadge(+1);
+        // Auto-expire threat from counter after 30s
+        setTimeout(()=> updateThreatBadge(-1), 30000);
+      }
+    } catch(err){ console.error('bad alert msg', err); }
+  };
+  wsAlerts.onerror = () => wsAlerts.close();
+}
+
+(async function(){
+  await loadZones();
+  await refreshHeatmap();
+  await backfillFeed();
+  setInterval(refreshHeatmap, 2000);
+  connectWS();
+})();
+</script>
+</body>
+</html>
